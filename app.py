@@ -114,8 +114,8 @@ learning_store.apply_to_detector(hit_detector)
 insect_train_store = InsectTrainStore(APP_DIR)
 auto_cal = AutoCalibrator(cal_table, hit_detector, hit_store=cal_hit_store)
 
-# Water Line Priming System
-primer = PrimingSystem(relay)
+# Water Line Priming System (SW-001 §2.7: open-solenoid fill + pressure build)
+primer = PrimingSystem(relay, accum=accum)
 # Timed priming keep-alive removed — pressure maintain is AccumulatorManager (SW-001 §2.7)
 
 # Autonomous Hunt Mode — SW-001 §2.13 (started ON after camera boot)
@@ -202,12 +202,12 @@ def apply_settings_to_runtime(data: dict | None = None) -> dict:
         if "cal_retry_pulse" in pulse:
             auto_cal.RETRY_DURATION = max(0.01, min(float(pulse["cal_retry_pulse"]), 2.0))
         if "prime_duration_ms" in pulse and hasattr(primer, "prime_duration_ms"):
-            primer.prime_duration_ms = max(500, min(int(pulse["prime_duration_ms"]), 10000))
+            primer.prime_duration_ms = max(500, min(int(pulse["prime_duration_ms"]), 30000))
         applied["pulse"] = {
             "operational_pulse": accum.DEFAULT_PULSE_SEC,
             "cal_pulse": auto_cal.FIRE_DURATION,
             "cal_retry_pulse": auto_cal.RETRY_DURATION,
-            "prime_duration_ms": getattr(primer, "prime_duration_ms", 3000),
+            "prime_duration_ms": getattr(primer, "prime_duration_ms", 10000),
         }
 
     prime = data.get("prime") or {}
@@ -575,7 +575,7 @@ def api_settings_get():
             "operational_pulse": relay.fire_pump.__defaults__[0] if relay.fire_pump.__defaults__ else 0.025,
             "cal_pulse": auto_cal.FIRE_DURATION,
             "cal_retry_pulse": auto_cal.RETRY_DURATION,
-            "prime_duration_ms": getattr(primer, "prime_duration_ms", 3000),
+            "prime_duration_ms": getattr(primer, "prime_duration_ms", 10000),
         },
         "calibration": {
             "offset_pitch": cal_table.offset_pitch,
@@ -1001,8 +1001,14 @@ def api_prime_status():
 
 @app.route('/api/prime/now', methods=['POST'])
 def api_prime_now():
-    """Manually trigger a prime sequence."""
-    result = primer.prime(gimbal=gimbal, camera=sniper_cam)
+    """Manually trigger two-stage prime: open-solenoid fill + build pressure."""
+    result = primer.prime(gimbal=gimbal, camera=sniper_cam, accum=accum)
+    log_event("PRIME", status=result.get("status"),
+              duration_ms=result.get("duration_ms"),
+              pumped_sec=result.get("pumped_sec"),
+              psi=result.get("psi"),
+              target_psi=result.get("target_psi"),
+              water_detected=result.get("water_detected"))
     return jsonify(result)
 
 
@@ -1067,7 +1073,7 @@ def api_pulse_config_get():
         "operational_pulse": relay.fire_pump.__defaults__[0] if relay.fire_pump.__defaults__ else 0.025,
         "cal_pulse": auto_cal.FIRE_DURATION,
         "cal_retry_pulse": auto_cal.RETRY_DURATION,
-        "prime_duration_ms": primer.prime_duration_ms if hasattr(primer, 'prime_duration_ms') else 3000,
+        "prime_duration_ms": primer.prime_duration_ms if hasattr(primer, 'prime_duration_ms') else 10000,
     })
 
 
@@ -1089,13 +1095,13 @@ def api_pulse_config_set():
         print(f"[app] Calibration retry pulse set to {auto_cal.RETRY_DURATION*1000:.0f}ms")
     if "prime_duration_ms" in data:
         if hasattr(primer, 'prime_duration_ms'):
-            primer.prime_duration_ms = max(500, min(int(data["prime_duration_ms"]), 10000))
+            primer.prime_duration_ms = max(500, min(int(data["prime_duration_ms"]), 30000))
             print(f"[app] Prime duration set to {primer.prime_duration_ms}ms")
     return jsonify({
         "operational_pulse": relay.fire_pump.__defaults__[0] if relay.fire_pump.__defaults__ else 0.025,
         "cal_pulse": auto_cal.FIRE_DURATION,
         "cal_retry_pulse": auto_cal.RETRY_DURATION,
-        "prime_duration_ms": primer.prime_duration_ms if hasattr(primer, 'prime_duration_ms') else 3000,
+        "prime_duration_ms": primer.prime_duration_ms if hasattr(primer, 'prime_duration_ms') else 10000,
     })
 
 

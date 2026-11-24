@@ -1061,8 +1061,8 @@
         </div>
         <div class="sl">
           <label>Prime Duration</label>
-          <input type="range" id="set-prime-dur2" min="500" max="10000" step="100" value="3000" oninput="$('set-prime-dur2-v').textContent=this.value+'ms'">
-          <div class="v" id="set-prime-dur2-v">3000ms</div>
+          <input type="range" id="set-prime-dur2" min="500" max="30000" step="500" value="10000" oninput="$('set-prime-dur2-v').textContent=this.value+'ms'">
+          <div class="v" id="set-prime-dur2-v">10000ms</div>
         </div>
         <button class="btn btn-blue" style="width:100%;margin-top:10px" onclick="applyPulseConfig()">✅ Apply Pulse (runtime)</button>
         <p style="font-size:10px;color:var(--dim);margin-top:8px">Operational pulse is used for live mosquito targeting. Calibration uses longer pulses for visible splash detection.</p>
@@ -1080,11 +1080,11 @@
     <div class="card">
       <div class="card-title">💧 Water Line Priming</div>
       <div class="card-body">
-        <p style="font-size:11px;color:var(--dim2);margin-bottom:14px">One-shot fill of the water line before firing. Timed 5‑min pump keep-alive is removed — while armed, pressure is held by <b>Accumulator Target PSI</b>.</p>
+        <p style="font-size:11px;color:var(--dim2);margin-bottom:14px">Two-stage prime: aims down, opens solenoid + runs pump to purge air bubbles, then closes solenoid and builds pressure to <b>Accumulator Target PSI</b>.</p>
         <div class="sl">
-          <label>Prime Duration (ms)</label>
-          <input type="range" id="set-prime-dur" min="500" max="10000" step="100" value="3000" oninput="$('set-prime-dur-v').textContent=this.value+'ms'">
-          <div class="v" id="set-prime-dur-v">3000ms</div>
+          <label>Prime Fill Duration (ms)</label>
+          <input type="range" id="set-prime-dur" min="500" max="30000" step="500" value="10000" oninput="$('set-prime-dur-v').textContent=this.value+'ms'">
+          <div class="v" id="set-prime-dur-v">10000ms</div>
         </div>
         <div style="display:flex;gap:12px;align-items:center;margin:10px 0">
           <label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer">
@@ -1182,13 +1182,14 @@ function fire(){
 }
 
 async function primeFromFireControl() {
-  $('fire-prime-status').textContent = '💧 Priming... aiming down & pumping';
+  $('fire-prime-status').textContent = '💧 Priming... solenoid OPEN (filling line) → building PSI';
   try {
     const d = await fetch('/api/prime/now', {method:'POST'}).then(r => r.json());
+    const psiTxt = (d.psi != null) ? ` · ${d.psi} PSI` : '';
     if (d.status === 'primed') {
-      $('fire-prime-status').textContent = '✅ Primed! Water detected.';
+      $('fire-prime-status').textContent = `✅ Primed! Water detected${psiTxt}.`;
     } else if (d.status === 'prime_uncertain') {
-      $('fire-prime-status').textContent = '⚠️ Primed (uncertain detection)';
+      $('fire-prime-status').textContent = `⚠️ Primed (uncertain detection)${psiTxt}`;
     } else {
       $('fire-prime-status').textContent = '❌ ' + (d.error || d.status);
     }
@@ -2318,13 +2319,14 @@ async function applyPrimeSettings() {
 }
 
 async function primeNow() {
-  $('prime-status').textContent = '💧 Priming... aiming down & pumping';
+  $('prime-status').textContent = '💧 Priming... aiming down, solenoid OPEN (fill) → building PSI';
   try {
     const d = await fetch('/api/prime/now', {method:'POST'}).then(r => r.json());
+    const psiTxt = (d.psi != null) ? ` Pressure: ${d.psi} PSI.` : '';
     if (d.status === 'primed') {
-      $('prime-status').textContent = `✅ Primed! Water detected: ${d.water_detected}. Pumped ${d.pumped_sec}s.`;
+      $('prime-status').textContent = `✅ Primed! Water detected: ${d.water_detected}. Flushed ${d.pumped_sec}s.${psiTxt}`;
     } else if (d.status === 'prime_uncertain') {
-      $('prime-status').textContent = `⚠️ Primed but water detection uncertain. Pumped ${d.pumped_sec}s.`;
+      $('prime-status').textContent = `⚠️ Primed (water detection uncertain). Flushed ${d.pumped_sec}s.${psiTxt}`;
     } else {
       $('prime-status').textContent = `❌ ${d.status}: ${d.error || 'Unknown error'}`;
     }

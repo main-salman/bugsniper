@@ -1,8 +1,8 @@
 # SW-001: Software Specification
 
 **Status:** APPROVED  
-**Version:** 5.23  
-**Last Updated:** 2026-07-29  
+**Version:** 5.24  
+**Last Updated:** 2026-11-24  
 **Owner:** Salman
 
 ## 1. Runtime Environment
@@ -146,13 +146,20 @@ auto-bump short pulses to 100 ms on load (that migration was removed 2026-07-28)
 **Solenoid drive:** every open pulse must run under `RelayController.pulse_solenoid()`
 (lock held for the open window). **Option B (`pico`):** Jetson sends `FIRE <ms>`
 and the Pico times GP15 (preferred for short pulses). `OPEN`/`CLOSE` used for
-DRAIN PIPE. CH2 / PR.05 unused. **Legacy (`legacy_module`):** while ARMED, Relay
+DRAIN PIPE and Stage 1 of Water Line Priming. CH2 / PR.05 unused. **Legacy (`legacy_module`):** while ARMED, Relay
 CH2 stays ON (`set_module_power_hold`); shots toggle SIG; idle watchdog holds
 SIG LOW. Disarm / auto-cal end: `recover_solenoid()`.
 **Maintenance drain:** `POST /api/line/drain` (Control tab **DRAIN PIPE**) runs
 solenoid OPEN + pump ON for N seconds (default **15**, clamp 1–30) under the
 relay lock, then pump OFF / valve CLOSED + `recover_solenoid()`. Disarms
-accumulator first. This is the only intentional pump+open-valve overlap.
+accumulator first.
+**Water line priming (`PrimingSystem` / `POST /api/prime/now`):** two-stage
+sequence to purge air bubbles and build pressure:
+1. If `AccumulatorManager` is currently armed, disarm first (remembering to re-arm after).
+2. Aim gimbal straight down to safe dump direction (`PRIME_PITCH = 90.0°`, `PRIME_YAW = 0.0°`).
+3. **Stage 1 — Fill / purge air:** run solenoid OPEN + pump ON under the relay lock (`_pulse_busy = True`, matching `drain_line()`) for `prime_duration_ms` (default **10000 ms**, clamp **500–30000 ms**). If `auto_detect` is enabled, capture the Sniper `after_frame` while water is flowing (just before stopping). Always stop pump OFF → close solenoid in `finally:` + `recover_solenoid(re_pinmux=False)`.
+4. **Stage 2 — Build pressure:** with solenoid CLOSED, charge the accumulator to `TARGET_PSI` via `AccumulatorManager.charge_pressure()` (or `arm()` if it was armed before priming), using closed-loop PSI when the transducer is connected or `INITIAL_CHARGE_SEC` timed fallback otherwise.
+5. Restore gimbal to its previous `(pitch, yaw)` and mark primed.
 **Removed:** pump-as-shot for engagements; timed Priming keep-alive.
 
 ### 2.12 Activity Log (`activity_log.py`)

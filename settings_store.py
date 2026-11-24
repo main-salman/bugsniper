@@ -54,10 +54,10 @@ DEFAULTS: dict[str, Any] = {
         "operational_pulse": 0.010,  # mirrors accumulator.default_pulse_ms (10 ms)
         "cal_pulse": 0.010,
         "cal_retry_pulse": 0.010,
-        "prime_duration_ms": 3000,
+        "prime_duration_ms": 10000,
     },
     "prime": {
-        "prime_duration_ms": 3000,
+        "prime_duration_ms": 10000,
         "auto_detect": True,
     },
     "stabilize": {

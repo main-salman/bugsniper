@@ -1459,3 +1459,9 @@ Three factors combine to make sub-10ms relay-gated diaphragm pump shots inherent
 ## 2026-08-03 — [RESEARCH] Photon Matrix LiDAR mosquito detect → Bug Sniper
 - **[RESEARCH]** Photon Matrix (photonmatrixlab.com): detect = LiDAR plane scan vs solid background + size (2–20 mm) + track/predict; laser kill not adopted. FAQ also lists mmWave + vision.
 - **[SPEC]** ADR-004; next-steps HTML `#photon` section — ranging anomaly confirm is the transferable lesson; blocked until TF-Luna (or equivalent) reinstalled.
+
+## 2026-11-24 — [BUG FIX] Two-stage water line priming (solenoid OPEN to purge air, then build PSI)
+- **[ROOT CAUSE]** `PrimingSystem.prime()` previously ran the pump with the NC solenoid CLOSED, dead-heading into the valve and pressurizing the accumulator while leaving air trapped in the line/nozzle.
+- **[SPEC]** `SW-001` §2.7 → v5.24: two-stage priming — Stage 1 opens solenoid + runs pump under relay lock (`_pulse_busy=True`, default 10s, clamp 0.5–30s) aimed down (`90°/0°`) with mid-flow `auto_detect` frame capture, then stops pump and closes solenoid; Stage 2 builds pressure to `TARGET_PSI` with solenoid closed (re-arming if previously armed).
+- **[CODE]** Added `RelayController.prime_flush()` and `AccumulatorManager.charge_pressure()` in `hardware.py`; updated `PrimingSystem.prime()`, `app.py`, `calibration_engine.py`, `settings_store.py` (default `prime_duration_ms=10000`, max `30000`), and `templates/index.html` sliders/status copy.
+- **[TEST]** Added `tests/test_priming.py` (4 unit tests covering 10s default/clamp, disarmed two-stage flow, armed disarm→flush→re-arm, and Pico-open failure abort).

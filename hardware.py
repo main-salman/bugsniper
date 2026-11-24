@@ -801,6 +801,69 @@ class RelayController:
             "solenoid": self._solenoid_state,
         }
 
+    def prime_flush(self, duration_sec: float = 10.0, on_mid_flow=None) -> dict:
+        """
+        Stage 1 of water-line priming (SW-001 §2.7):
+        Open solenoid + run pump for duration_sec to purge air bubbles through
+        the tubing and nozzle. Holds the relay lock with _pulse_busy=True so
+        the idle watchdog cannot close the valve mid-prime.
+        Optionally invokes on_mid_flow() while water is flowing (just before
+        stopping) so camera auto-detect can see the live stream.
+        Always ends with pump OFF and solenoid CLOSED.
+        """
+        duration_sec = max(0.5, min(float(duration_sec), 30.0))
+        t0 = time.time()
+        print(f"[RelayController] 💧 PRIME FLUSH: solenoid OPEN + pump ON for "
+              f"{duration_sec:.1f}s")
+        with self._lock:
+            self._pulse_busy = True
+            try:
+                self._set_solenoid(True)
+                if self.using_pico and self._pico is not None and not self._solenoid_state:
+                    return {
+                        "status": "error",
+                        "error": "Solenoid failed to open (Pico disconnected)",
+                        "duration_sec": round(duration_sec, 2),
+                        "elapsed_sec": round(time.time() - t0, 2),
+                        "pump": self._pump_state,
+                        "solenoid": self._solenoid_state,
+                    }
+                # Direct pump GPIO — do not use paths that can touch SIG
+                self._pump_state = True
+                if JETSON_AVAILABLE:
+                    GPIO.output(RELAY_PUMP_PIN, GPIO.HIGH)
+                print("[RelayController] Pump ON (prime flush — valve stays OPEN)")
+                if on_mid_flow is not None and duration_sec > 0.35:
+                    time.sleep(duration_sec - 0.3)
+                    try:
+                        on_mid_flow()
+                    except Exception as cb_err:
+                        print(f"[RelayController] prime_flush callback error: {cb_err}")
+                    time.sleep(0.3)
+                else:
+                    time.sleep(duration_sec)
+                    if on_mid_flow is not None:
+                        try:
+                            on_mid_flow()
+                        except Exception as cb_err:
+                            print(f"[RelayController] prime_flush callback error: {cb_err}")
+            finally:
+                self._pump_state = False
+                if JETSON_AVAILABLE:
+                    GPIO.output(RELAY_PUMP_PIN, GPIO.LOW)
+                print("[RelayController] Pump OFF")
+                self._set_solenoid(False)
+                self._pulse_busy = False
+        elapsed = time.time() - t0
+        print(f"[RelayController] 💧 PRIME FLUSH complete in {elapsed:.1f}s — valve CLOSED")
+        return {
+            "status": "complete",
+            "duration_sec": round(duration_sec, 2),
+            "elapsed_sec": round(elapsed, 2),
+            "pump": self._pump_state,
+            "solenoid": self._solenoid_state,
+        }
+
     def set_solenoid_power(self, state: bool):
         """
         Manual override for Relay CH2 (module 12V). Ignored when hardwired.
@@ -1096,6 +1159,33 @@ class AccumulatorManager:
         print(f"[AccumulatorManager] {label}: done in {elapsed:.2f}s → {psi_str} "
               f"(mode={mode}, reached={result['reached_target']})")
         return result
+
+    def charge_pressure(self, label: str = "💧 PRIME CHARGE") -> dict:
+        """
+        Build accumulator pressure to TARGET_PSI with solenoid CLOSED without
+        changing the ARMED state (used by Stage 2 of PrimingSystem, SW-001 §2.7).
+        """
+        with self._lock:
+            if self._state == self.STATE_CHARGING:
+                return {"status": "already_charging"}
+            self._state = self.STATE_CHARGING
+
+        try:
+            charge_budget = (self.MAX_PUMP_RUN_SEC if self._pressure_connected()
+                             else self.INITIAL_CHARGE_SEC)
+            charge = self._charge(charge_budget, label)
+            with self._lock:
+                self._last_charge_time = time.time()
+            reached = charge.get("reached_target")
+            status = "pressure_not_ready" if reached is False else "charged"
+            return {"status": status, **charge}
+        except Exception as e:
+            self._relay.set_pump(False)
+            self._relay.set_solenoid(False)
+            return {"status": "error", "error": str(e)}
+        finally:
+            with self._lock:
+                self._state = self.STATE_ARMED if self._armed else self.STATE_IDLE
 
     def arm(self) -> dict:
         """
@@ -1602,8 +1692,9 @@ class PrimingSystem:
     PRIME_YAW = 0.0     # Center yaw
     IDLE_REPRIME_SEC = 600.0  # Re-prime if no fire for this long
 
-    def __init__(self, relay: RelayController):
+    def __init__(self, relay: RelayController, accum: Optional['AccumulatorManager'] = None):
         self._relay = relay
+        self._accum = accum
         self._lock = threading.Lock()
 
         # State
@@ -1613,7 +1704,7 @@ class PrimingSystem:
         self._last_fire_time = 0.0
 
         # Settings (defaults)
-        self.prime_duration_ms = 3000      # 3 seconds default
+        self.prime_duration_ms = 10000     # 10 seconds default (fill pipe & purge air)
         self.auto_detect = True            # Use camera to confirm
 
     def start_keepalive(self, gimbal=None):
@@ -1635,17 +1726,22 @@ class PrimingSystem:
                 return True
             return False
 
-    def prime(self, gimbal=None, camera=None) -> dict:
+    def prime(self, gimbal=None, camera=None, accum=None) -> dict:
         """
-        Run the priming sequence:
-        1. Aim nozzle straight down
-        2. Pump for configured duration
-        3. (Optional) Auto-detect water via camera
-        4. Mark as primed
+        Run the two-stage priming sequence (SW-001 §2.7):
+        1. Disarm accumulator if currently armed (remember to re-arm after)
+        2. Aim nozzle straight down (safe dump direction)
+        3. Stage 1 — Fill / purge air: solenoid OPEN + pump ON for
+           prime_duration_ms (captures after_frame mid-flow if auto_detect),
+           then pump OFF + solenoid CLOSED + recover_solenoid()
+        4. Stage 2 — Build pressure: with solenoid CLOSED, charge accumulator
+           to TARGET_PSI (or re-arm if it was armed before priming)
+        5. Restore gimbal position and mark as primed
 
         Args:
             gimbal: ServoTurretController to aim the nozzle down
             camera: Sniper CameraStream for auto-detection (optional)
+            accum: AccumulatorManager override (optional; defaults to self._accum)
 
         Returns:
             dict with priming results
@@ -1655,18 +1751,29 @@ class PrimingSystem:
                 return {"status": "already_priming"}
             self._priming_in_progress = True
 
+        acc = accum if accum is not None else self._accum
         result = {"status": "priming", "duration_ms": self.prime_duration_ms}
+        gimbal_moved = False
+        restore_pitch = 0.0
+        restore_yaw = 0.0
 
         try:
+            # Step 0: Disarm accumulator before opening solenoid so maintain loop doesn't fight
+            was_armed = False
+            if acc is not None and acc.get_status().get("armed"):
+                was_armed = True
+                print("[Priming] Disarming accumulator before open-solenoid fill...")
+                acc.disarm(reason="priming")
+
             # Step 1: Aim straight down
             if gimbal:
                 print(f"[Priming] Aiming nozzle down ({self.PRIME_PITCH}°, {self.PRIME_YAW}°)")
-                # Save current position to restore later
                 current_status = gimbal.get_status()
                 restore_pitch = current_status.get("pitch", 0)
                 restore_yaw = current_status.get("yaw", 0)
 
                 gimbal.set_angles(self.PRIME_PITCH, self.PRIME_YAW)
+                gimbal_moved = True
                 time.sleep(1.5)  # Let servo settle
                 result["aimed_down"] = True
 
@@ -1677,19 +1784,37 @@ class PrimingSystem:
                 if before_frame is not None:
                     before_frame = before_frame.copy()
 
-            # Step 3: Pump for the configured duration
+            # Step 3 (Stage 1): Open solenoid + pump ON to fill pipe & purge air
             duration_sec = self.prime_duration_ms / 1000.0
-            print(f"[Priming] Pumping for {self.prime_duration_ms}ms...")
-            self._relay.set_pump(True)
-            time.sleep(duration_sec)
-            self._relay.set_pump(False)
-            result["pumped_sec"] = duration_sec
+            after_holder = {"frame": None}
 
-            # Step 4: Auto-detect water flow
+            def _capture_mid_flow():
+                if self.auto_detect and camera and before_frame is not None:
+                    f = camera.get_frame()
+                    if f is not None:
+                        after_holder["frame"] = f.copy()
+
+            print(f"[Priming] Stage 1 — Solenoid OPEN + Pump ON for {self.prime_duration_ms}ms...")
+            flush = self._relay.prime_flush(
+                duration_sec,
+                on_mid_flow=_capture_mid_flow if (self.auto_detect and camera) else None,
+            )
+            if flush.get("status") == "error":
+                result["status"] = "error"
+                result["error"] = flush.get("error", "prime flush failed")
+                print(f"[Priming] ❌ Stage 1 failed: {result['error']}")
+                return result
+
+            self._relay.recover_solenoid(re_pinmux=False)
+            result["pumped_sec"] = flush.get("elapsed_sec", duration_sec)
+            result["solenoid_opened"] = True
+
+            # Step 4: Auto-detect water flow (from mid-flow frame captured while valve was open)
             water_detected = False
             if self.auto_detect and camera and before_frame is not None:
-                time.sleep(0.3)  # Brief settle
-                after_frame = camera.get_frame()
+                after_frame = after_holder["frame"]
+                if after_frame is None:
+                    after_frame = camera.get_frame()
                 if after_frame is not None:
                     water_detected = self._detect_water_flow(before_frame, after_frame)
                     result["water_detected"] = water_detected
@@ -1698,11 +1823,18 @@ class PrimingSystem:
                 water_detected = True  # Assume success without detection
                 result["water_detected"] = "assumed"
 
-            # Step 5: Restore gimbal position
-            if gimbal:
-                print(f"[Priming] Restoring gimbal to ({restore_pitch}°, {restore_yaw}°)")
-                gimbal.set_angles(restore_pitch, restore_yaw)
-                time.sleep(1.0)
+            # Step 5 (Stage 2): Close solenoid and build pressure to TARGET_PSI
+            if acc is not None:
+                print("[Priming] Stage 2 — Solenoid CLOSED, building pressure to Target PSI...")
+                if was_armed:
+                    charge_res = acc.arm()
+                else:
+                    charge_res = acc.charge_pressure(label="💧 PRIME CHARGE")
+                result["pressure_charge"] = charge_res
+                result["psi"] = charge_res.get("psi")
+                result["target_psi"] = charge_res.get("target_psi")
+                result["reached_target"] = charge_res.get("reached_target")
+                result["re_armed"] = bool(was_armed and charge_res.get("status") == "armed")
 
             # Mark as primed
             with self._lock:
@@ -1712,13 +1844,21 @@ class PrimingSystem:
 
             result["status"] = "primed" if water_detected else "prime_uncertain"
             result["timestamp"] = stamp_hms()
-            print(f"[Priming] Complete: {'✅ Water detected' if water_detected else '⚠️ Uncertain'}")
+            psi_note = f", {result['psi']} PSI" if result.get("psi") is not None else ""
+            print(f"[Priming] Complete: {'✅ Water detected' if water_detected else '⚠️ Uncertain'}{psi_note}")
 
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
             print(f"[Priming] Error: {e}")
         finally:
+            if gimbal and gimbal_moved:
+                try:
+                    print(f"[Priming] Restoring gimbal to ({restore_pitch}°, {restore_yaw}°)")
+                    gimbal.set_angles(restore_pitch, restore_yaw)
+                    time.sleep(1.0)
+                except Exception as ge:
+                    print(f"[Priming] Gimbal restore error: {ge}")
             with self._lock:
                 self._priming_in_progress = False
 
@@ -1781,7 +1921,7 @@ class PrimingSystem:
     def update_settings(self, settings: dict):
         """Update priming settings from the API."""
         if "prime_duration_ms" in settings:
-            self.prime_duration_ms = max(500, min(int(settings["prime_duration_ms"]), 10000))
+            self.prime_duration_ms = max(500, min(int(settings["prime_duration_ms"]), 30000))
         if "auto_detect" in settings:
             self.auto_detect = bool(settings["auto_detect"])
         # keepalive_* keys ignored (deprecated)

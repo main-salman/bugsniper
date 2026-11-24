@@ -1135,7 +1135,8 @@ class AutoCalibrator:
 
             result = self._primer.prime(
                 gimbal=self._gimbal,
-                camera=self._sniper_cam
+                camera=self._sniper_cam,
+                accum=self._accum
             )
 
             status = "✅ Water detected" if result.get("water_detected") == True else \

@@ -127,3 +127,4 @@
 2026-07-31 | [DOCS] | next-steps HTML: clear Tornyol/LeSonar → Bug Sniper explanation
 2026-07-31 | [BUG FIX] | LiDAR stub no longer invents 1.5–3.5m; None when disconnected (no TF-Luna installed)
 2026-08-03 | [RESEARCH] | Photon Matrix: LiDAR Δrange+size detect lessons → ADR-004 + next-steps HTML
+2026-11-24 | [BUG FIX] | Two-stage priming: solenoid OPEN + pump ON (10s default) to purge air, then close solenoid + charge to Target PSI (SW-001 v5.24)
